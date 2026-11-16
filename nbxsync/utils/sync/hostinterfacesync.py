@@ -1,6 +1,8 @@
 from ipam.models import IPAddress
 from nbxsync.models import ZabbixServerAssignment
 
+from nbxsync.choices.syncsot import SyncSOT
+
 from .syncbase import ZabbixSyncBase
 
 
@@ -10,6 +12,16 @@ class HostInterfaceSync(ZabbixSyncBase):
 
     def api_object(self):
         return self.api.hostinterface
+
+    def sync(self):
+        # Since Zabbix 8.0, hostinterface.create/update/delete no longer exist.
+        # Interfaces are written by HostSync through host.create / host.update(interfaces=...).
+        # Here we only read back from Zabbix when Zabbix is the source of truth.
+        if not self.obj.interfaceid or self.sot != SyncSOT.ZABBIX:
+            return
+        found = self.api.hostinterface.get(output='extend', interfaceids=str(self.obj.interfaceid))
+        if len(found) == 1:
+            self.sync_from_zabbix(found[0])
 
     def get_name_value(self):
         return self.obj.assigned_object.name

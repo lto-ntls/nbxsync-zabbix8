@@ -71,6 +71,7 @@ class HostSync(ZabbixSyncBase):
             **self.get_tag_attributes(),
             **self.get_macros(),
             **self.get_hostinventory(),
+            **self.get_interfaces_attributes(hostid=None),
         }
 
     def get_update_params(self, **kwargs):
@@ -87,7 +88,108 @@ class HostSync(ZabbixSyncBase):
         # Add hostid separately
         params['hostid'] = self.obj.hostid
 
+        # Zabbix 8.0: interfaces can only be managed through host.create / host.update
+        params.pop('interfaces', None)
+        params.update(self.get_interfaces_attributes(hostid=self.obj.hostid))
+
         return params
+
+    # ------------------------------------------------------------------
+    # Host interface handling (Zabbix 8.0 removed hostinterface.create/
+    # update/delete/massadd/massremove; host.update(interfaces=...) works
+    # on every Zabbix version supported by zabbix_utils, 6.0 -> 8.0)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _interface_key(data):
+        return (
+            int(data.get('type', 0)),
+            str(data.get('ip') or ''),
+            str(data.get('dns') or ''),
+            str(data.get('port') or ''),
+            int(data.get('useip', 1)),
+        )
+
+    def _netbox_hostinterfaces(self):
+        hostinterfaces = self.context.get('all_objects', {}).get('hostinterfaces', None)
+        if hostinterfaces is None:
+            return None
+        return sorted(hostinterfaces, key=lambda hi: (-int(hi.interface_type == 1), hi.type, hi.id))
+
+    def get_interfaces_payload(self, hostid=None):
+        """Build the full 'interfaces' list for host.create / host.update.
+
+        Returns None when the interfaces are unknown (no all_objects in context),
+        so that a host.update never wipes the interfaces by accident.
+        """
+        hostinterfaces = self._netbox_hostinterfaces()
+        if hostinterfaces is None:
+            return None
+
+        existing_ids = set()
+        if hostid:
+            existing_ids = {str(i['interfaceid']) for i in self.api.hostinterface.get(output=['interfaceid'], hostids=str(hostid))}
+
+        payload = []
+        for hostinterface in hostinterfaces:
+            params = HostInterfaceSync(self.api, hostinterface, hostid=hostid or 'pending').get_create_params()
+            if not params:
+                continue
+            params.pop('hostid', None)
+            if hostid and hostinterface.interfaceid and str(hostinterface.interfaceid) in existing_ids:
+                params['interfaceid'] = str(hostinterface.interfaceid)
+            payload.append(params)
+        return payload
+
+    def get_interfaces_attributes(self, hostid=None):
+        payload = self.get_interfaces_payload(hostid=hostid)
+        if payload is None:
+            return {}
+        return {'interfaces': payload}
+
+    def reconcile_interfaceids(self, hostid=None):
+        """After host.create/host.update, store the Zabbix interfaceid on each NetBox ZabbixHostInterface."""
+        hostid = hostid or self.obj.hostid
+        hostinterfaces = self._netbox_hostinterfaces()
+        if not hostid or hostinterfaces is None:
+            return
+
+        zabbix_interfaces = self.api.hostinterface.get(output='extend', hostids=str(hostid))
+        by_id = {str(i['interfaceid']): i for i in zabbix_interfaces}
+        unclaimed = {}
+        for zbx in zabbix_interfaces:
+            unclaimed.setdefault(self._interface_key(zbx), []).append(str(zbx['interfaceid']))
+
+        for hostinterface in hostinterfaces:
+            current = str(hostinterface.interfaceid) if hostinterface.interfaceid else None
+            params = HostInterfaceSync(self.api, hostinterface, hostid=hostid).get_create_params()
+            key = self._interface_key(params) if params else None
+
+            if current and current in by_id:
+                ids = unclaimed.get(self._interface_key(by_id[current]), [])
+                if current in ids:
+                    ids.remove(current)
+                continue
+
+            new_id = unclaimed.get(key, []).pop(0) if key and unclaimed.get(key) else None
+            ZabbixHostInterface.objects.filter(pk=hostinterface.pk).update(interfaceid=int(new_id) if new_id else None)
+            hostinterface.interfaceid = int(new_id) if new_id else None
+            try:
+                if new_id:
+                    hostinterface.update_sync_info(success=True)
+                else:
+                    hostinterface.update_sync_info(success=False, message='Interface not found in Zabbix after host update.')
+            except Exception:
+                pass
+
+    def try_create(self):
+        hostid = super().try_create()
+        if hostid:
+            self.reconcile_interfaceids(hostid)
+        return hostid
+
+    def update_in_zabbix(self, **kwargs):
+        super().update_in_zabbix(**kwargs)
+        self.reconcile_interfaceids(self.obj.hostid)
 
     def result_key(self):
         return 'hostids'
@@ -482,96 +584,47 @@ class HostSync(ZabbixSyncBase):
             self.obj.update_sync_info(success=False, message=f'Failed to delete host: {e}')
             raise RuntimeError(f'Failed to delete host {self.obj.hostid} from Zabbix: {e}')
 
+    def _push_interfaces(self):
+        """Send the complete interface set to Zabbix in one host.update call.
+
+        Creating, updating, deleting and switching the default ('main') interface
+        all happen atomically, which is the only way that works on Zabbix 8.0.
+        """
+        if not self.obj.hostid:
+            return
+        hostid = str(int(self.obj.hostid))
+        payload = self.get_interfaces_payload(hostid=hostid)
+        if payload is None:
+            return
+        self.api.host.update(hostid=hostid, interfaces=payload)
+        self.reconcile_interfaceids(hostid)
+
     def check_default_hostinterface(self):
         if not self.obj.hostid:
             return
 
         hostid = str(int(self.obj.hostid))
         netbox_hostinterfaces = self.context.get('all_objects', {}).get('hostinterfaces', [])
-        zabbix_hostinterfaces = self.api.hostinterface.get(hostids=hostid)
+        zabbix_hostinterfaces = self.api.hostinterface.get(output=['interfaceid', 'type', 'main'], hostids=hostid)
 
-        netbox_default_obj_by_type = {}
-        netbox_default_id_by_type = {}
-        zabbix_default_id_by_type = {}
+        netbox_default = {int(hi.type): (str(int(hi.interfaceid)) if hi.interfaceid else None) for hi in netbox_hostinterfaces if int(getattr(hi, 'interface_type', 0)) == 1}
+        zabbix_default = {int(zi['type']): str(int(zi['interfaceid'])) for zi in zabbix_hostinterfaces if int(zi.get('main', 0)) == 1}
 
-        # Loop through all Netbox Host Interfaces and get the default interface id per type
-        for netbox_hostinterface in netbox_hostinterfaces:
-            if int(getattr(netbox_hostinterface, 'interface_type', 0)) == 1:
-                netbox_default_obj_by_type[int(netbox_hostinterface.type)] = netbox_hostinterface
-                interface_id = None
-                if getattr(netbox_hostinterface, 'interfaceid', None):
-                    interface_id = str(int(netbox_hostinterface.interfaceid))
-
-                netbox_default_id_by_type[int(netbox_hostinterface.type)] = interface_id
-
-        # Loop through all Zabbix Host Interfaces and get the default interface id per type
-        for zabbix_hostinterface in zabbix_hostinterfaces:
-            if int(zabbix_hostinterface.get('main', 0)) == 1:
-                zabbix_default_id_by_type[int(zabbix_hostinterface.get('type'))] = str(int(zabbix_hostinterface.get('interfaceid')))
-
-        all_types = set(netbox_default_id_by_type) | set(zabbix_default_id_by_type)
-
-        for hostinterface_type in sorted(all_types):
-            nb_default_hostinterface_obj = netbox_default_obj_by_type.get(hostinterface_type)
-            nb_default_hostinterface_id = netbox_default_id_by_type.get(hostinterface_type)
-            zbx_default_hostinterfaceid = zabbix_default_id_by_type.get(hostinterface_type)
-
-            if not zbx_default_hostinterfaceid:
-                # No zabbix interfaces?
-                # Nothing to do here in that case
-                continue
-
-            if nb_default_hostinterface_id != zbx_default_hostinterfaceid:
-                # If NB default interface doesn't exist yet in Zabbix, create it as non-default first
-                if not nb_default_hostinterface_id:
-                    syncer = HostInterfaceSync(self.api, nb_default_hostinterface_obj, hostid=hostid)
-                    params = syncer.get_create_params()
-                    if not params:
-                        continue
-
-                    params['main'] = 0  # create as NON-default
-                    created = self.api.hostinterface.create(**params)
-                    hostinterface_id = created.get('interfaceids', [None])[0]
-                    if not hostinterface_id:
-                        raise RuntimeError(f'Failed to create interface for type={hostinterface_type}: {created}')
-
-                    nb_default_hostinterface_obj.interfaceid = int(hostinterface_id)
-                    nb_default_hostinterface_obj.save()
-
-                    # update local variable so the compare is correct for the flip step
-                    nb_default_hostinterface_id = str(int(hostinterface_id))
-
-                # Some very 'complicated' logic to flip the main
-                # As Zabbix can have only 1 default/main interface at the time, we must update all interfaces at once
-                # As such, we loop through all hostinterfaces, and use the HostInterfaceSync module to get the create params
-                # That way, we can update all interfaces at once
-                desired_hostinterfaces = []
-                for netbox_hostinterface in netbox_hostinterfaces:
-                    syncer = HostInterfaceSync(self.api, netbox_hostinterface, hostid=hostid)
-                    params = syncer.get_update_params()
-                    if not params or not params.get('interfaceid'):
-                        continue
-                    desired_hostinterfaces.append(params)
-
-                self.api.host.update(hostid=hostid, interfaces=desired_hostinterfaces)
-        return
+        if any(netbox_default.get(t) != zabbix_default.get(t) for t in zabbix_default):
+            self._push_interfaces()
 
     def verify_hostinterfaces(self):
-        # If there is no hostid, no need to continue - so fail early
         if not self.obj.hostid:
             return {}
 
-        # Extract the currently expected interfaces
         expected_hostinterfaces = self.context.get('all_objects', {}).get('hostinterfaces', [])
-        expected_ids = {int(expected_hostinterface.interfaceid) for expected_hostinterface in expected_hostinterfaces}
+        expected_ids = {int(hi.interfaceid) for hi in expected_hostinterfaces if hi.interfaceid}
+        current_ids = {int(zi['interfaceid']) for zi in self.api.hostinterface.get(output=['interfaceid'], hostids=self.obj.hostid)}
 
-        # Get currently assigned hostinterface from Zabbix
-        current_hostinterfaces = self.api.hostinterface.get(output=['extend'], hostids=self.obj.hostid)
-        current_ids = {int(current_hostinterface['interfaceid']) for current_hostinterface in current_hostinterfaces}
-
-        to_be_deleted = current_ids - expected_ids
-        for id_to_delete in to_be_deleted:
-            self.api.hostinterface.delete(id_to_delete)
+        # Interfaces present in Zabbix but not in NetBox: host.update with the
+        # full list removes them (hostinterface.delete no longer exists in 8.0)
+        if current_ids - expected_ids or any(not hi.interfaceid for hi in expected_hostinterfaces):
+            self._push_interfaces()
 
     def sanitize_string(self, input_str, replacement='_'):
         """
